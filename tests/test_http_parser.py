@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+import zlib
 from contextlib import nullcontext
 from typing import Any, Dict, List
 from unittest import mock
@@ -1844,3 +1845,70 @@ class TestDeflateBuffer:
         dbuf.feed_eof()
 
         assert buf.at_eof()
+
+    @pytest.mark.parametrize(
+        "chunk_size",
+        [1024, 2**14, 2**16],  # 1KB, 16KB, 64KB
+        ids=["1KB", "16KB", "64KB"],
+    )
+    async def test_streaming_decompress_large_payload(
+        self, protocol: BaseProtocol, chunk_size: int
+    ) -> None:
+        """Test that large payloads decompress correctly when streamed in chunks.
+
+        This simulates real HTTP streaming where compressed data arrives in
+        small network chunks. Each chunk's decompressed output should be within
+        the max_decompress_size limit, allowing full recovery of the original data.
+        """
+        # Create a large payload (3MiB) that compresses well
+        original = b"A" * (3 * 2**20)
+        compressed = zlib.compress(original)
+
+        buf = aiohttp.StreamReader(protocol, 2**16, loop=asyncio.get_running_loop())
+        dbuf = DeflateBuffer(buf, "deflate")
+
+        # Feed compressed data in chunks (simulating network streaming)
+        for i in range(0, len(compressed), chunk_size):
+            chunk = compressed[i : i + chunk_size]
+            dbuf.feed_data(chunk, len(chunk))
+
+        dbuf.feed_eof()
+
+        # Read all decompressed data
+        result = b"".join(buf._buffer)
+        assert len(result) == len(original)
+        assert result == original
+
+    async def test_feed_data_decompress_size_limit(
+        self, protocol: BaseProtocol
+    ) -> None:
+        """A single chunk that expands past the limit is rejected (CVE-2025-69223).
+
+        A tiny compressed payload that expands to 1MiB must not be inflated
+        past ``max_decompress_size``; the stream is aborted instead.
+        """
+        original = b"A" * 2**20
+        compressed = zlib.compress(original)
+        assert len(compressed) < 2**12
+
+        buf = aiohttp.StreamReader(protocol, 2**16, loop=asyncio.get_running_loop())
+        dbuf = DeflateBuffer(buf, "deflate", max_decompress_size=1024)
+
+        with pytest.raises(http_exceptions.ContentEncodingError, match="exceeds"):
+            dbuf.feed_data(compressed, len(compressed))
+
+        assert sum(len(chunk) for chunk in buf._buffer) <= 1024
+
+    async def test_feed_data_within_decompress_size_limit(
+        self, protocol: BaseProtocol
+    ) -> None:
+        """Output at or below the limit is passed through untouched."""
+        original = b"A" * 1024
+        compressed = zlib.compress(original)
+
+        buf = aiohttp.StreamReader(protocol, 2**16, loop=asyncio.get_running_loop())
+        dbuf = DeflateBuffer(buf, "deflate", max_decompress_size=1024)
+        dbuf.feed_data(compressed, len(compressed))
+        dbuf.feed_eof()
+
+        assert b"".join(buf._buffer) == original

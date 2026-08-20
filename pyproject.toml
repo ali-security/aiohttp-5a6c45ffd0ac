@@ -2,6 +2,11 @@
 requires = [
     "pkgconfig",
     "setuptools >= 46.4.0",
+    # CVE-2025-69223: on non-CPython the vendored Brotli >= 1.2 backend is built
+    # through cffi (``aiohttp/_vendored/brotlicffi/_build.py``), so cffi must be
+    # present in the isolated build environment. CPython builds the vendored
+    # backend as a plain C extension and needs nothing extra here.
+    "cffi; platform_python_implementation != 'CPython'",
 ]
 build-backend = "setuptools.build_meta"
 
