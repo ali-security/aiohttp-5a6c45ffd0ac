@@ -4,6 +4,7 @@ import contextlib
 import datetime
 import heapq
 import itertools
+import json
 import os  # noqa
 import pathlib
 import pickle
@@ -16,6 +17,7 @@ from http.cookies import BaseCookie, Morsel, SimpleCookie
 from typing import (
     DefaultDict,
     Dict,
+    FrozenSet,
     Iterable,
     Iterator,
     List,
@@ -46,6 +48,46 @@ _FORMAT_DOMAIN_REVERSED = "{1}.{0}".format
 # heap too often when there are only a few scheduled expirations.
 _MIN_SCHEDULED_COOKIE_EXPIRATION = 100
 _SIMPLE_COOKIE = SimpleCookie()
+
+
+class _RestrictedCookieUnpickler(pickle._Unpickler):
+    """A restricted unpickler that only allows cookie-related types.
+
+    This prevents arbitrary code execution when loading pickled cookie data
+    from untrusted sources. Only types that are expected in a serialized
+    CookieJar are permitted.
+
+    Subclasses :class:`pickle._Unpickler` (the pure-Python implementation)
+    rather than :class:`pickle.Unpickler` because the accelerated unpickler
+    on some implementations (notably PyPy) does not dispatch through
+    :meth:`find_class` overrides.
+
+    See: https://docs.python.org/3/library/pickle.html#restricting-globals
+    """
+
+    _ALLOWED_CLASSES: FrozenSet[Tuple[str, str]] = frozenset(
+        {
+            # Core cookie types
+            ("http.cookies", "SimpleCookie"),
+            ("http.cookies", "Morsel"),
+            # Container types used by CookieJar._cookies
+            ("collections", "defaultdict"),
+            # builtins that pickle uses for reconstruction
+            ("builtins", "tuple"),
+            ("builtins", "set"),
+            ("builtins", "frozenset"),
+            ("builtins", "dict"),
+        }
+    )
+
+    def find_class(self, module: str, name: str) -> type:
+        if (module, name) not in self._ALLOWED_CLASSES:
+            raise pickle.UnpicklingError(
+                f"Forbidden class: {module}.{name}. "
+                "CookieJar.load() only allows cookie-related types for security. "
+                "See https://docs.python.org/3/library/pickle.html#restricting-globals"
+            )
+        return super().find_class(module, name)  # type: ignore[no-any-return]
 
 
 class CookieJar(AbstractCookieJar):
@@ -123,14 +165,85 @@ class CookieJar(AbstractCookieJar):
         return self._quote_cookie
 
     def save(self, file_path: PathLike) -> None:
+        """Save cookies to a file using JSON format.
+
+        :param file_path: Path to file where cookies will be serialized,
+            :class:`str` or :class:`pathlib.Path` instance.
+        """
         file_path = pathlib.Path(file_path)
-        with file_path.open(mode="wb") as f:
-            pickle.dump(self._cookies, f, pickle.HIGHEST_PROTOCOL)
+        data: Dict[str, Dict[str, Dict[str, Union[str, bool]]]] = {}
+        for (domain, path), cookie in self._cookies.items():
+            key = f"{domain}|{path}"
+            data[key] = {}
+            for name, morsel in cookie.items():
+                morsel_data: Dict[str, Union[str, bool]] = {
+                    "key": morsel.key,
+                    "value": morsel.value,
+                    "coded_value": morsel.coded_value,
+                }
+                # Save all morsel attributes that have values
+                for attr in morsel._reserved:  # type: ignore[attr-defined]
+                    attr_val = morsel[attr]
+                    if attr_val:
+                        morsel_data[attr] = attr_val
+                data[key][name] = morsel_data
+        with file_path.open(mode="w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
 
     def load(self, file_path: PathLike) -> None:
+        """Load cookies from a file.
+
+        Tries to load JSON format first. Falls back to loading legacy
+        pickle format (using a restricted unpickler) for backward
+        compatibility with existing cookie files.
+
+        :param file_path: Path to file from where cookies will be
+            imported, :class:`str` or :class:`pathlib.Path` instance.
+        """
         file_path = pathlib.Path(file_path)
-        with file_path.open(mode="rb") as f:
-            self._cookies = pickle.load(f)
+        # Try JSON format first
+        try:
+            with file_path.open(mode="r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._cookies = self._load_json_data(data)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            # Fall back to legacy pickle format with restricted unpickler
+            with file_path.open(mode="rb") as f:
+                self._cookies = _RestrictedCookieUnpickler(f).load()
+
+    def _load_json_data(
+        self, data: Dict[str, Dict[str, Dict[str, Union[str, bool]]]]
+    ) -> DefaultDict[Tuple[str, str], SimpleCookie]:
+        """Load cookies from parsed JSON data."""
+        cookies: DefaultDict[Tuple[str, str], SimpleCookie] = defaultdict(SimpleCookie)
+        for compound_key, cookie_data in data.items():
+            domain, path = compound_key.split("|", 1)
+            key = (domain, path)
+            for name, morsel_data in cookie_data.items():
+                morsel: Morsel[str] = Morsel()
+                morsel_key = morsel_data["key"]
+                morsel_value = morsel_data["value"]
+                morsel_coded_value = morsel_data["coded_value"]
+                # We use __setstate__ instead of the public set() API because
+                # it allows us to bypass validation and set already validated
+                # state, the same pattern used in _build_morsel.
+                morsel.__setstate__(  # type: ignore[attr-defined]
+                    {
+                        "key": morsel_key,
+                        "value": morsel_value,
+                        "coded_value": morsel_coded_value,
+                    }
+                )
+                # Restore morsel attributes
+                for attr in morsel._reserved:  # type: ignore[attr-defined]
+                    if attr in morsel_data and attr not in (
+                        "key",
+                        "value",
+                        "coded_value",
+                    ):
+                        morsel[attr] = morsel_data[attr]
+                cookies[key][name] = morsel
+        return cookies
 
     def clear(self, predicate: Optional[ClearCookiePredicate] = None) -> None:
         if predicate is None:
